@@ -10,6 +10,7 @@ leży w zapisie w dwóch miejscach:
 server/embs/gd/box liczy, ile egzemplarzy każdego przedmiotu gra wylosowała.
 """
 
+import struct
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -55,6 +56,7 @@ class Place:
     source: str        # ODWIEDZONA / WYLOSOWANA / 'zadanie' / 'bohater'
     atom: str = ""
     entries: list = field(default_factory=list)
+    pos: tuple = None  # (x, z) w jednostkach świata; płaszczyzna mapy to x/z, y to wysokość
 
     def add(self, *a, **kw):
         self.entries.append(Entry(*a, **kw))
@@ -105,7 +107,7 @@ class World:
             map_id = body.get("lt")
             src = ODWIEDZONA if map_id in self.visited else WYLOSOWANA
             p = Place(key, map_id, TYP_OBIEKTU.get(typ, typ), name, src,
-                      atom=self._atoms.get((map_id, body.get("auid")), ""))
+                      atom=self._atoms.get((map_id, body.get("auid")), ""), pos=_xz(body.get("pos")))
             shop = typ in ("building_trader", "building_castle")
 
             for item_id, item in strg(v, ".items") or []:
@@ -177,7 +179,7 @@ class World:
                 typ = "Zamek"
             name = self.g.hint(hint) if hint else ""
             src = ODWIEDZONA if map_id in self.visited else WYLOSOWANA
-            p = Place(f"emb:{n}", map_id, typ, name, src, atom=atom)
+            p = Place(f"emb:{n}", map_id, typ, name, src, atom=atom, pos=_xz(ii0.get("p")))
             self._walk(pg, p, "sklep" if cls in ("castle", "npc", "!container") else "skrzynia")
             if p.entries:
                 self.places.append(p)
@@ -304,6 +306,14 @@ RESOURCES = {"money", "crystals", "leadership", "experience", "rune_might", "run
 
 def _miejsc(n):
     return "miejsce" if n == 1 else ("miejsca" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "miejsc")
+
+
+def _xz(raw):
+    """Pozycja obiektu (4 x float32: x, y, z, w) -> (x, z) albo None."""
+    if isinstance(raw, bytes) and len(raw) >= 12:
+        x, _, z = struct.unpack_from("<3f", raw)
+        return x, z
+    return None
 
 
 def _num(v):

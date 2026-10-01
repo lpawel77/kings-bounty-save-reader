@@ -148,6 +148,8 @@ class GameData:
         self._zips, self._lower, self._images, self._textures = {}, {}, {}, {}
         self._atlas_idx = None
         self._units = {}
+        self._map_sizes = {}
+        self.session_dir = None
         if self.game_dir:
             try:
                 self._load(session.strip("/") or "addon")
@@ -170,6 +172,7 @@ class GameData:
                 m = re.search(r'~session\s+"(\w+)"', ini)
                 session = m.group(1) if m else session
         sdir = self.game_dir / "sessions" / session
+        self.session_dir = sdir
         with zipfile.ZipFile(sdir / "ses.kfs") as z:
             names = set(z.namelist())
 
@@ -222,7 +225,7 @@ class GameData:
             "maxcount": _int(b.get("maxcount")), "level": b.get("level"),
             "race": b.get("race"), "slot": slot, "bits": bits, "set": b.get("setref"),
             "upgrade": use.get("upgrade") if use else "", "file": fname,
-            "image": b.get("image"),
+            "image": b.get("image"), "bonuses": _bonuses(b),
         }
 
     # --- nazwy ---
@@ -399,6 +402,130 @@ class GameData:
     def unit_image(self, unit_id):
         return self.image(f"{unit_id}.png")
 
+    # --- mapy ---
+
+    def radar_image(self, map_id):
+        """Minimapa lokacji (radar_<mapa>.png, 1024 x 1024) albo None."""
+        return self.image(f"radar_{map_id}.png")
+
+    def map_size(self, map_id):
+        """Rozmiar mapy w jednostkach świata (kafle z <mapa>.land.loc po 16 jednostek) albo None."""
+        if map_id not in self._map_sizes:
+            size = None
+            try:
+                from kb_save import Reader
+                with zipfile.ZipFile(self.session_dir / "ses.kfs") as z:
+                    land = Reader(z.read(f"{map_id}.land.loc")).root()
+                size = (land.get("lsizex") * TILE, land.get("lsizey") * TILE)
+            except (OSError, KeyError, TypeError, ValueError, AttributeError, zipfile.BadZipFile):
+                pass
+            self._map_sizes[map_id] = size
+        return self._map_sizes[map_id]
+
+    def map_uv(self, map_id, pos):
+        """Pozycja (x, z) -> współrzędne na minimapie (0..1, 0..1) albo None.
+
+        Minimapa obejmuje kwadrat RADAR_SPAN x RADAR_SPAN jednostek z mapą pośrodku,
+        oś z rośnie ku górze obrazka (ustalone porównaniem z zamkami na minimapach)."""
+        size = self.map_size(map_id)
+        if not pos or not size:
+            return None
+        span = max(RADAR_SPAN, *size)
+        u = (pos[0] + (span - size[0]) / 2) / span
+        v = 1 - (pos[1] + (span - size[1]) / 2) / span
+        return u, v
+
+
+TILE, RADAR_SPAN = 16, 256
+
+# premie przedmiotów: sekcja mods (bohater) i fight (wojska w bitwie)
+PREMIE_BOHATERA = {"attack": "Atak", "defense": "Obrona", "intellect": "Intelekt",
+                   "leadership": "Przywództwo", "mana": "Mana (maks.)", "rage": "Furia (maks.)",
+                   "booksize": "Pojemność księgi"}
+PREMIE_WOJSK = {"attack": "Atak wojsk", "defense": "Obrona wojsk", "moral": "Morale wojsk",
+                "krit": "Trafienie krytyczne wojsk", "speed": "Szybkość wojsk",
+                "initiative": "Inicjatywa wojsk", "health": "Zdrowie wojsk", "hitback": "Kontratak wojsk",
+                "hitbackprotect": "Ochrona przed kontratakiem"}
+GRUPY_PREMII = ["bohater", "wojska", "odporność", "obrażenia", "wrogowie", "zdolność"]
+
+
+def _bonuses(b):
+    """Premie przedmiotu: [{label, value, pct, group, limited}]; group według GRUPY_PREMII."""
+    out = []
+    mods = b.child("mods")
+    for k, v in (mods.fields.items() if mods else []):
+        parts = v.split(",")
+        try:
+            val = float(parts[1].rstrip("%"))
+        except (IndexError, ValueError):
+            continue
+        pct = parts[1].strip().endswith("%") if len(parts) > 1 else False
+        if k in PREMIE_BOHATERA:
+            out.append({"label": PREMIE_BOHATERA[k], "value": val, "pct": pct, "group": "bohater", "limited": False})
+        elif k.startswith("sp_"):
+            out.append({"label": "Zdolność: " + _sp_label(k[3:]), "value": val, "pct": pct,
+                        "group": "zdolność", "limited": False})
+    fight = b.child("fight")
+    for c in (fight.children if fight else []):
+        flt = c.child("filter")
+        f = flt.fields if flt else {}
+        enemy = f.get("belligerent") == "enemy"
+        limited = any(f.get(k) for k in ("unit", "race", "features", "level", "nfeatures"))
+        for kind in ("pbonus", "rbonus", "dbonus"):
+            parts = [x.strip() for x in c.get(kind).split(",")]
+            if len(parts) < 3 or not parts[0]:
+                continue
+            try:
+                flat, prc = float(parts[1] or 0), float(parts[2] or 0)
+            except ValueError:
+                continue
+            val, pct = (flat, False) if flat else (prc, True)
+            if not val:
+                continue
+            stat = parts[0]
+            if kind == "pbonus":
+                label = PREMIE_WOJSK.get(stat, f"{stat} wojsk")
+                group = "wojska"
+            elif kind == "rbonus":
+                label, group, pct = f"Odporność wojsk: {OBRAZENIA.get(stat, stat)}", "odporność", True
+            else:
+                label, group = f"Obrażenia wojsk: {OBRAZENIA.get(stat, stat)}", "obrażenia"
+            if enemy:
+                label = "Wrogowie: " + label.replace(" wojsk", "")
+                group = "wrogowie"
+            out.append({"label": label, "value": val, "pct": pct, "group": group, "limited": limited})
+    return out
+
+
+SP_ZDOLNOSCI = {"addexp_battle": "doświadczenie za bitwę", "addgold_battle": "złoto za bitwę",
+                "addexp_spirit": "doświadczenie duszy", "mana_battle": "mana w bitwie",
+                "mana_map_prc": "odnawianie many na mapie", "rage_map": "furia na mapie",
+                "rage_battle_prc": "furia w bitwie", "boots_speed": "szybkość na mapie",
+                "set_trap": "pułapki", "trap_attack": "atak pułapek", "lightning_attack": "atak błyskawicą",
+                "subgold_battle": "złoto (inne)", "battle_alshemy": "alchemia bitewna",
+                "antihero_rage": "furia przeciw bohaterom", "rage_predator": "furia drapieżnika"}
+
+
+def _sp_label(key):
+    """Zdolność specjalna przedmiotu (klucz sp_*) w czytelnej postaci."""
+    if key in SP_ZDOLNOSCI:
+        return SP_ZDOLNOSCI[key]
+    for prefix, label in (("lead_", "przywództwo dla: "), ("attack_", "atak przeciw: "),
+                          ("spell_", "wzmocnienie czaru: ")):
+        if key.startswith(prefix):
+            return label + key[len(prefix):].replace("_", " ")
+    return key.replace("_", " ")
+
+
+def bonus_text(bn):
+    v = bn["value"]
+    num = f"{v:+g}" + ("%" if bn["pct"] else "")
+    return f"{num} {bn['label']}" + (" (niektóre jednostki)" if bn["limited"] else "")
+
+
+def bonus_good(bn):
+    """Premia korzystna dla gracza: dodatnia, a dla wrogów - ujemna."""
+    return bn["value"] < 0 if bn["group"] == "wrogowie" else bn["value"] > 0
 
 OBRAZENIA = {"physical": "fizyczne", "poison": "trucizna", "magic": "magia", "fire": "ogień",
              "astral": "astralne", "cold": "zimno"}

@@ -11,18 +11,22 @@ import io
 import json
 import os
 import sys
+from collections import defaultdict
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from kb_gamedata import RASY, SLOTY, SZKOLY, GameData, find_game_dirs, is_game_dir
+from kb_gamedata import (GRUPY_PREMII, RASY, SLOTY, SZKOLY, GameData, bonus_good, bonus_text,
+                         find_game_dirs, is_game_dir)
 
 try:
     from PIL import Image, ImageTk
 except ImportError:  # bez Pillow aplikacja działa, tylko bez obrazków
     Image = ImageTk = None
+from kb_mapview import MapView
 from kb_save import load_save, print_report
 from kb_world import ARMY, ITEM, RES, ROLA, SPELL, UNIT, World, pretty_atom
+from kb_world import _miejsc as miejsc
 
 APP_TITLE = "King's Bounty – czytnik zapisu"
 CONFIG = Path(os.environ.get("APPDATA") or Path.home()) / "kb_save_reader.json"
@@ -111,6 +115,13 @@ class App(tk.Tk):
     def __init__(self, path=None):
         super().__init__()
         self.title(APP_TITLE)
+        # ikona okna: obok skryptu albo wewnątrz pliku .exe (PyInstaller rozpakowuje do _MEIPASS)
+        ico = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "kb_icon.ico"
+        if ico.is_file():
+            try:
+                self.iconbitmap(default=str(ico))
+            except tk.TclError:
+                pass
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{min(1500, sw - 60)}x{min(900, sh - 100)}+20+20")
         self.minsize(980, 600)
@@ -121,6 +132,10 @@ class App(tk.Tk):
         self.save_path = None
         self._dup_maps = set()
         self._photos = {}
+        self.cur_map = None          # mapa pokazana w podglądzie
+        self.hl = None               # wyróżnienie: {"title", "keys", "maps"}
+        self.visible_by_map, self.map_iid, self.iid_map = {}, {}, {}
+        self.map_combo_ids = []
         self._style()
         self._build()
         start = path or self.cfg.get("last_save")
@@ -154,7 +169,31 @@ class App(tk.Tk):
         st.configure("Title.TLabel", font=("Segoe UI", 13, "bold"))
         st.configure("Sub.TLabel", foreground="#555")
         st.configure("Head.TLabel", font=("Segoe UI", 11, "bold"))
+        self._style_tabs(st)
         self.option_add("*TCombobox*Listbox.font", base)
+
+    def _style_tabs(self, st):
+        # zakładki motywu vista są rysowane natywnie i ignorują kolory,
+        # więc element karty pożyczamy z motywu clam (płaski, da się kolorować)
+        try:
+            st.element_create("KB.Notebook.tab", "from", "clam")
+        except tk.TclError:
+            return
+        st.layout("TNotebook.Tab", [("KB.Notebook.tab", {"sticky": "nswe", "children": [
+            ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                ("Notebook.label", {"side": "top", "sticky": ""})]})]})])
+        st.configure("TNotebook", tabmargins=(0, 4, 0, 0))
+        st.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"), padding=(18, 8),
+                     background="#dfe5ec", foreground="#3a4654",
+                     bordercolor="#b4bfcc", lightcolor="#dfe5ec", darkcolor="#dfe5ec")
+        sel, hot = "#0b5cad", "#c9d7e8"
+        st.map("TNotebook.Tab",
+               background=[("selected", sel), ("active", hot)],
+               lightcolor=[("selected", sel), ("active", hot)],
+               darkcolor=[("selected", sel), ("active", hot)],
+               bordercolor=[("selected", sel)],
+               foreground=[("selected", "white"), ("active", "#0b3f78")],
+               expand=[("selected", (0, 2, 0, 0))])
 
     # --- układ okna -----------------------------------------------------------
 
@@ -214,32 +253,63 @@ class App(tk.Tk):
             ttk.Checkbutton(bar, text=label, variable=v, command=self.fill_places).pack(side="left", padx=4)
             self.pl_kinds[kind] = v
 
+        # układ: po lewej lista miejsc nad zawartością wybranego miejsca, po prawej duża mapa
         pane = ttk.PanedWindow(tab, orient="horizontal")
         pane.pack(fill="both", expand=True)
-        left, self.pl_tree = scrolled(pane, ttk.Treeview, columns=("info",), show="tree headings",
-                                      selectmode="browse")
+        left = ttk.PanedWindow(pane, orient="vertical")
+        fr_tree, self.pl_tree = scrolled(left, ttk.Treeview, columns=("info",), show="tree headings",
+                                         selectmode="browse", height=12)
         self.pl_tree.heading("#0", text="Mapa / miejsce")
         self.pl_tree.heading("info", text="Zawartość")
-        self.pl_tree.column("#0", width=330)
-        self.pl_tree.column("info", width=250)
+        self.pl_tree.column("#0", width=300)
+        self.pl_tree.column("info", width=210)
         self.pl_tree.tag_configure("map", font=("Segoe UI", 10, "bold"))
         self.pl_tree.tag_configure("unvisited", foreground="#6b4e00")
         self.pl_tree.tag_configure("group", font=("Segoe UI", 10, "bold"), foreground="#0b5cad")
         self.pl_tree.bind("<<TreeviewSelect>>", lambda e: self.show_place())
-        pane.add(left, weight=1)
+        left.add(fr_tree, weight=3)
 
-        right = ttk.Frame(pane, padding=(8, 0, 0, 0))
-        self.pl_head = ttk.Label(right, text="Wybierz miejsce z listy", style="Head.TLabel")
+        bottom = ttk.Frame(left, padding=(0, 8, 0, 0))
+        self.pl_head = ttk.Label(bottom, text="Wybierz miejsce z listy", style="Head.TLabel")
         self.pl_head.pack(anchor="w")
-        self.pl_sub = ttk.Label(right, text="", style="Sub.TLabel", wraplength=700, justify="left")
+        self.pl_sub = ttk.Label(bottom, text="", style="Sub.TLabel", wraplength=560, justify="left")
         self.pl_sub.pack(anchor="w", pady=(0, 6))
-        fr, self.pl_items = table(right, [
-            ("kind", "Rodzaj", 100, "w"), ("name", "Nazwa", 210, "w"), ("count", "Ilość", 65, "e"),
-            ("type", "Typ / szkoła", 130, "w"), ("level", "Poziom", 65, "center"),
-            ("role", "Jak zdobyć", 140, "w"), ("note", "Uwagi", 160, "w")], icon=True)
+        fr, self.pl_items = table(bottom, [
+            ("kind", "Rodzaj", 95, "w"), ("name", "Nazwa", 190, "w"), ("count", "Ilość", 60, "e"),
+            ("type", "Typ / szkoła", 115, "w"), ("level", "Poziom", 60, "center"),
+            ("role", "Jak zdobyć", 120, "w"), ("note", "Uwagi", 120, "w")], height=7, icon=True)
         fr.pack(fill="both", expand=True)
         self.pl_items.bind("<Double-1>", lambda e: self._goto_entry(self.pl_items))
-        pane.add(right, weight=1)
+        bottom.bind("<Configure>", lambda e: self.pl_sub.config(wraplength=max(200, e.width - 10)))
+        left.add(bottom, weight=2)
+        pane.add(left, weight=2)
+
+        right = ttk.Frame(pane, padding=(8, 0, 0, 0))
+        mbar = ttk.Frame(right)
+        mbar.pack(fill="x", pady=(0, 4))
+        ttk.Label(mbar, text="Mapa:").pack(side="left")
+        self.map_combo = ttk.Combobox(mbar, state="readonly", width=38)
+        self.map_combo.bind("<<ComboboxSelected>>", lambda e: self._map_combo_pick())
+        self.map_combo.pack(side="left", padx=(4, 10))
+        self.mapview = MapView(right, on_pick=self._map_pick, label_fn=self._marker_label)
+        self.mapview.pack(fill="both", expand=True)
+        # wiersz z wyróżnieniem ("Pokaż na mapie") - widoczny tylko, gdy coś jest wyróżnione
+        self.map_hl_bar = ttk.Frame(right)
+        self.map_hl_lbl = ttk.Label(self.map_hl_bar, text="", foreground="#8a6d00", font=("Segoe UI", 10, "bold"))
+        self.map_hl_lbl.pack(side="left")
+        ttk.Button(self.map_hl_bar, text="× Wyczyść wyróżnienie",
+                   command=self.clear_highlight).pack(side="left", padx=10)
+        pane.add(right, weight=3)
+
+        def init_sashes(event):
+            # przy pierwszym wyświetleniu: mapa (kwadratowa) dostaje szerokość równą swojej wysokości,
+            # lista resztę, ale nie mniej niż 30% okna
+            if event.width > 100 and not getattr(self, "_sashes_set", False):
+                self._sashes_set = True
+                map_w = event.height - mbar.winfo_reqheight() + 16
+                pane.sashpos(0, max(int(event.width * 0.30), event.width - map_w))
+                left.after_idle(lambda: left.sashpos(0, int(left.winfo_height() * 0.55)))
+        pane.bind("<Configure>", init_sashes, add="+")
         self.place_by_iid = {}
         self.iid_by_place = {}
 
@@ -259,6 +329,16 @@ class App(tk.Tk):
         self.it_status.current(0)
         self.it_status.bind("<<ComboboxSelected>>", lambda e: self.fill_items())
         self.it_status.pack(side="left", padx=(4, 12))
+        bar = ttk.Frame(tab, padding=(0, 0, 0, 6))
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Premia:").pack(side="left")
+        self.it_bonus = ttk.Combobox(bar, state="readonly", width=34, values=["wszystkie"])
+        self.it_bonus.current(0)
+        self.it_bonus.bind("<<ComboboxSelected>>", lambda e: self.fill_items())
+        self.it_bonus.pack(side="left", padx=(4, 12))
+        self.it_desc_q = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Szukaj też w opisie", variable=self.it_desc_q,
+                        command=self.fill_items).pack(side="left", padx=(0, 10))
         self.it_all = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text="Pokaż medale i premie ukryte", variable=self.it_all,
                         command=self.fill_items).pack(side="left")
@@ -266,15 +346,16 @@ class App(tk.Tk):
         pane = ttk.PanedWindow(tab, orient="vertical")
         pane.pack(fill="both", expand=True)
         fr, self.it_tree = table(pane, [
-            ("name", "Nazwa", 230, "w"), ("type", "Typ", 110, "w"), ("level", "Poziom", 60, "center"),
+            ("name", "Nazwa", 230, "w"), ("type", "Typ", 110, "w"), ("bonus", "Premie", 260, "w"),
+            ("level", "Poziom", 60, "center"),
             ("race", "Rasa", 90, "w"), ("price", "Cena", 70, "e"), ("max", "Limit w grze", 105, "e"),
             ("box", "Wylosowano", 100, "e"), ("where", "Miejsc", 65, "e"), ("status", "Czy pojawi się w grze?", 380, "w")],
             height=8, icon=True)
         self.it_tree.bind("<<TreeviewSelect>>", lambda e: self.show_item())
         pane.add(fr, weight=1)
-        self.it_desc, self.it_where = self._detail_pane(pane)
+        self.it_desc, self.it_where = self._detail_pane(pane, lambda: self._map_from(self.it_tree, [ITEM]))
 
-    def _detail_pane(self, pane):
+    def _detail_pane(self, pane, on_map=None):
         """Dolny panel: obrazek i opis po lewej, lista miejsc występowania po prawej."""
         low = ttk.PanedWindow(pane, orient="horizontal")
         fr, txt = scrolled(low, tk.Text, width=58, height=17, wrap="word", font=("Segoe UI", 10),
@@ -290,9 +371,17 @@ class App(tk.Tk):
                 txt.tag_configure(k, foreground=color, font=("Segoe UI", 10, "bold"))
         txt.config(state="disabled")
         low.add(fr, weight=2)
-        fr2, where = table(low, self._where_columns(), height=8)
+        side = ttk.Frame(low)
+        if on_map:
+            bar = ttk.Frame(side)
+            bar.pack(fill="x", pady=(0, 4))
+            ttk.Button(bar, text="Pokaż na mapie", command=on_map).pack(side="left")
+            ttk.Label(bar, text="dwuklik na wierszu – przejście do miejsca na mapie",
+                      style="Sub.TLabel").pack(side="left", padx=8)
+        fr2, where = table(side, self._where_columns(), height=8)
+        fr2.pack(fill="both", expand=True)
         where.bind("<Double-1>", lambda e: self._goto_where(where))
-        low.add(fr2, weight=3)
+        low.add(side, weight=3)
         pane.add(low, weight=1)
         return txt, where
 
@@ -320,7 +409,7 @@ class App(tk.Tk):
             ("where", "Miejsc", 70, "e"), ("status", "Status", 300, "w")], height=8, icon=True)
         self.sp_tree.bind("<<TreeviewSelect>>", lambda e: self.show_spell())
         pane.add(fr, weight=1)
-        self.sp_desc, self.sp_where = self._detail_pane(pane)
+        self.sp_desc, self.sp_where = self._detail_pane(pane, lambda: self._map_from(self.sp_tree, [SPELL]))
 
     # zakładka 4: jednostki
     def _tab_units(self):
@@ -339,7 +428,7 @@ class App(tk.Tk):
             ("enemy", "Armii wroga", 120, "e"), ("mine", "W twojej armii", 140, "e")], height=8, icon=True)
         self.un_tree.bind("<<TreeviewSelect>>", lambda e: self.show_unit())
         pane.add(fr, weight=1)
-        self.un_desc, self.un_where = self._detail_pane(pane)
+        self.un_desc, self.un_where = self._detail_pane(pane, lambda: self._map_from(self.un_tree, [UNIT, ARMY]))
 
     # zakładka 5: bohater
     def _tab_hero(self):
@@ -435,9 +524,22 @@ class App(tk.Tk):
         self.sub_lbl.config(text=f"Dzień {z['dzien_gry']}  •  lokacja: {g.map_name(z['lokacja'] or '')}  •  "
                                  f"złoto {h['zloto']}  •  przywództwo {h['przywodztwo']}  •  "
                                  f"plik: {self.save_path} (zapisany {when})")
+        self.hl = None
+        self.map_hl_lbl.config(text="")
+        self.map_hl_bar.pack_forget()
+        self.cur_map = None
+        self._start_map = z["lokacja"] if any(m == z["lokacja"] for m, _ in w.maps()) else None
         types = sorted({self.item_type(i) for i in self._item_ids()})
         self.it_type.config(values=["wszystkie"] + types)
         self.it_type.current(0)
+        labels = {}
+        for it in g.items.values():
+            for bn in it.get("bonuses", []):
+                if bonus_good(bn):
+                    labels.setdefault(bn["label"], GRUPY_PREMII.index(bn["group"]))
+        self.it_bonus.config(values=["wszystkie", "dowolna premia dla bohatera", "dowolna premia dla wojsk"]
+                             + sorted(labels, key=lambda l: (labels[l], l)))
+        self.it_bonus.current(0)
         self.fill_places()
         self.fill_items()
         self.fill_spells()
@@ -565,6 +667,7 @@ class App(tk.Tk):
         t = self.pl_tree
         t.delete(*t.get_children())
         self.place_by_iid, self.iid_by_place = {}, {}
+        self.visible_by_map, self.map_iid, self.iid_map = defaultdict(list), {}, {}
         q = self.pl_q.get().strip().casefold()
         kinds = {k for k, v in self.pl_kinds.items() if v.get()}
         mode = self.pl_maps.get()
@@ -592,10 +695,12 @@ class App(tk.Tk):
                 rows.append((p, label, ents))
             if not rows:
                 continue
-            state = f"{len(rows)} {'miejsce' if len(rows) == 1 else 'miejsc'}" + (
+            state = f"{len(rows)} {miejsc(len(rows))}" + (
                 "" if special else (", odwiedzona" if visited else ", nieodwiedzona"))
             tags = ("group",) if special else ("map",) if visited else ("map", "unvisited")
             mnode = t.insert("", "end", text=map_name, values=(state,), open=bool(q), tags=tags)
+            if not special:
+                self.map_iid[map_id], self.iid_map[mnode] = mnode, map_id
             rows.sort(key=lambda r: (TYPE_ORDER.index(r[0].type) if r[0].type in TYPE_ORDER else 99,
                                      r[1].casefold()))
             for p, label, ents in rows:
@@ -606,6 +711,9 @@ class App(tk.Tk):
                 iid = t.insert(mnode, "end", text=label, values=(info,))
                 self.place_by_iid[iid] = p
                 self.iid_by_place[p.key] = iid
+                if p.map_id:
+                    self.visible_by_map[p.map_id].append(p)
+        self._update_map_combo()
         self.show_place()
 
     def show_place(self):
@@ -614,10 +722,20 @@ class App(tk.Tk):
         tv = self.pl_items
         tv.delete(*tv.get_children())
         if not p:
-            self.pl_head.config(text="Wybierz miejsce z listy")
-            self.pl_sub.config(text="Mapy odwiedzone pokazują stan bieżący (to, co jeszcze zostało). "
-                                    "Mapy nieodwiedzone pokazują to, co gra już wylosowała na początku rozgrywki.")
+            map_id = self.iid_map.get(sel[0]) if sel else None
+            if map_id:
+                n = len(self.visible_by_map.get(map_id, []))
+                state = "odwiedzona" if map_id in self.world.visited else "nieodwiedzona – zawartość już wylosowana"
+                self.pl_head.config(text=self.map_title(map_id))
+                self.pl_sub.config(text=f"{state}  •  {n} {miejsc(n)} na mapie  •  "
+                                        "kliknij punkt na mapie albo miejsce na liście")
+            else:
+                self.pl_head.config(text="Wybierz miejsce z listy")
+                self.pl_sub.config(text="Mapy odwiedzone pokazują stan bieżący (to, co jeszcze zostało). "
+                                        "Mapy nieodwiedzone pokazują to, co gra już wylosowała na początku rozgrywki.")
+            self.show_map(map_id or self.cur_map or getattr(self, "_start_map", None))
             return
+        self.show_map(p.map_id, selected=p.key)
         self.pl_head.config(text=self.place_label(p))
         sub = [self.map_label(p), self.map_state(p)]
         if p.atom and p.source not in ("zadanie",):
@@ -637,6 +755,114 @@ class App(tk.Tk):
             tv.insert("", "end", iid=f"e{i}", values=(e.kind, name, e.count, typ, lvl,
                                                       ROLA.get(e.role, e.role), e.note), tags=tags,
                       **self.icon_kw(e.kind, e.id))
+
+    # --- podgląd mapy ------------------------------------------------------------
+
+    def show_map(self, map_id, selected=None):
+        mv, g = self.mapview, self.game
+        if not map_id or not g:
+            mv.show(None, [], message="To miejsce nie ma pozycji na mapie (nagroda za zadanie, rozmowa albo bohater)."
+                    if selected or self.pl_tree.selection() else "Wybierz mapę lub miejsce z listy.")
+            return
+        places = list(self.visible_by_map.get(map_id, []))
+        if self.hl:
+            have = {p.key for p in places}
+            places += [p for p in self.world.places
+                       if p.map_id == map_id and p.key in self.hl["keys"] and p.key not in have]
+        markers = []
+        for p in places:
+            uv = g.map_uv(map_id, p.pos)
+            if uv:
+                markers.append((p, uv[0], uv[1]))
+        img = g.radar_image(map_id)
+        if img:
+            msg = ""
+        elif ImageTk is None:
+            msg = "Podgląd mapy wymaga biblioteki Pillow (pip install pillow)."
+        else:
+            msg = "Brak minimapy tej lokacji w plikach gry (albo nie wskazano folderu gry)."
+        keep = map_id == self.cur_map
+        self.cur_map = map_id
+        mv.show(img, markers, highlight=self.hl["keys"] if self.hl else (), selected=selected,
+                keep_view=keep, message=msg)
+        if selected and keep:
+            mv.center_on(selected)
+        if map_id in self.map_combo_ids:
+            self.map_combo.current(self.map_combo_ids.index(map_id))
+
+    def _update_map_combo(self):
+        if not self.world:
+            return
+        ids = [m for m, _ in self.world.maps()]
+        counts = self.hl["maps"] if self.hl else {}
+        ids.sort(key=lambda m: -counts.get(m, 0))
+        self.map_combo_ids = ids
+        self.map_combo.config(values=[self.map_title(m) + (f"   ★ {counts[m]}" if counts.get(m) else "")
+                                      for m in ids])
+        if self.cur_map in ids:
+            self.map_combo.current(ids.index(self.cur_map))
+
+    def _map_combo_pick(self):
+        i = self.map_combo.current()
+        if i < 0:
+            return
+        map_id = self.map_combo_ids[i]
+        node = self.map_iid.get(map_id)
+        if node:
+            self.pl_tree.selection_set(node)
+            self.pl_tree.see(node)
+        else:
+            self.show_map(map_id)
+
+    def _map_pick(self, p):
+        self.goto_place(p.key)
+
+    def _marker_label(self, p):
+        names = []
+        for e in p.entries:
+            if e.kind == RES:
+                continue
+            n = self.ename(e.kind, e.id)
+            if n not in names:
+                names.append(n)
+        extra = ", ".join(names[:4]) + (f" … (+{len(names) - 4})" if len(names) > 4 else "")
+        return self.place_label(p) + (f"\n{extra}" if extra else "")
+
+    def _map_from(self, tree, kinds):
+        sel = tree.selection()
+        if sel:
+            self.show_on_map(kinds, sel[0], tree.set(sel[0], "name"))
+
+    def show_on_map(self, kinds, iid, title):
+        """Wyróżnia na mapach wszystkie miejsca, gdzie występuje przedmiot / czar / jednostka."""
+        by_map = defaultdict(list)
+        for k in kinds:
+            for p, _ in self.world.by_id.get((k, iid), []):
+                if p.map_id and p.pos and p.key not in by_map[p.map_id]:
+                    by_map[p.map_id].append(p.key)
+        if not by_map:
+            messagebox.showinfo(APP_TITLE, f"{title}: nie występuje w żadnym miejscu na mapach.\n"
+                                           "Może być tylko nagrodą za zadanie, u bohatera albo wcale.")
+            return
+        n = sum(len(v) for v in by_map.values())
+        self.hl = {"title": title, "keys": {k for v in by_map.values() for k in v},
+                   "maps": {m: len(v) for m, v in by_map.items()}}
+        self.map_hl_lbl.config(text=f"★ {title}: {n} {miejsc(n)} na "
+                                    f"{len(by_map)} {'mapie' if len(by_map) == 1 else 'mapach'}")
+        self.map_hl_bar.pack(fill="x", pady=(0, 4), before=self.mapview)
+        self._update_map_combo()
+        best = max(by_map, key=lambda m: len(by_map[m]))
+        self.cur_map = None
+        self.goto_place(by_map[best][0])
+
+    def clear_highlight(self):
+        self.hl = None
+        self.map_hl_lbl.config(text="")
+        self.map_hl_bar.pack_forget()
+        self._update_map_combo()
+        sel = self.pl_tree.selection()
+        p = self.place_by_iid.get(sel[0]) if sel else None
+        self.show_map(self.cur_map, selected=p.key if p else None)
 
     def goto_place(self, key):
         iid = self.iid_by_place.get(key)
@@ -691,16 +917,32 @@ class App(tk.Tk):
             return
         t = self.it_tree
         t.delete(*t.get_children())
+        self._item_score = {}
         q = self.it_q.get().strip().casefold()
         typ = self.it_type.get()
         st_label = self.it_status.get()
         st_key = next((k for k, l in STATUS_LABELS if l == st_label), "")
         show_all = self.it_all.get()
+        want = self.it_bonus.get()
+        in_desc = self.it_desc_q.get()
         n = 0
         for iid in self._item_ids():
             it = self.game.items.get(iid) or {}
             if not show_all and it.get("slot") in HIDDEN_SLOTS:
                 continue
+            bonuses = it.get("bonuses", [])
+            score = None
+            if want not in ("", "wszystkie"):
+                good = [bn for bn in bonuses if bonus_good(bn)]
+                if want == "dowolna premia dla bohatera":
+                    hits = [bn for bn in good if bn["group"] == "bohater"]
+                elif want == "dowolna premia dla wojsk":
+                    hits = [bn for bn in good if bn["group"] != "bohater" and bn["group"] != "zdolność"]
+                else:
+                    hits = [bn for bn in good if bn["label"] == want]
+                if not hits:
+                    continue
+                score = max(abs(bn["value"]) for bn in hits)
             name = self.game.item_name(iid)
             ity = self.item_type(iid)
             if typ not in ("", "wszystkie") and ity != typ:
@@ -708,15 +950,22 @@ class App(tk.Tk):
             key, text = self.world.item_status(iid)
             if st_key and key != st_key:
                 continue
-            if q and q not in name.casefold() and q not in iid.casefold():
+            if q and q not in name.casefold() and q not in iid.casefold() and not (
+                    in_desc and q in self.game.item_description(iid).casefold()):
                 continue
             where = len([x for x in self.world.by_id.get((ITEM, iid), []) if x[0].source != "bohater"])
+            btxt = ", ".join(bonus_text(bn).replace(" (niektóre jednostki)", "*") for bn in bonuses)
+            self._item_score[iid] = score
             t.insert("", "end", iid=iid, tags=(key,), **self.icon_kw(ITEM, iid), values=(
-                name, ity, it.get("level", ""), RASY.get(it.get("race"), it.get("race", "")),
+                name, ity, btxt, it.get("level", ""), RASY.get(it.get("race"), it.get("race", "")),
                 it.get("price") or "", it.get("maxcount") if it.get("maxcount") is not None else "",
                 self.world.box.get(iid, 0), where or "", text))
             n += 1
-        rows = sorted(t.get_children(), key=lambda k: t.set(k, "name").casefold())
+        if want not in ("", "wszystkie"):
+            # przy filtrze premii najmocniejsze na górze
+            rows = sorted(t.get_children(), key=lambda k: (-(self._item_score.get(k) or 0), t.set(k, "name").casefold()))
+        else:
+            rows = sorted(t.get_children(), key=lambda k: t.set(k, "name").casefold())
         for i, k in enumerate(rows):
             t.move(k, "", i)
         self.nb.tab(1, text=f"Przedmioty ({n})")
@@ -751,6 +1000,10 @@ class App(tk.Tk):
         txt.insert("end", ", ".join(facts) + f"\nid: {iid}\n", "s")
         status_key, status_text = self.world.item_status(iid)
         txt.insert("end", "\n" + status_text + "\n", status_key)
+        if it.get("bonuses"):
+            txt.insert("end", "Premie\n", "h2")
+            for bn in it["bonuses"]:
+                txt.insert("end", "• " + bonus_text(bn) + "\n", ("li",) if bonus_good(bn) else ("li", "brak"))
         if it.get("upgrade"):
             txt.insert("end", f"Można ulepszyć do: {g.item_name(it['upgrade'])}\n", "s")
         for src in self.world.upgraded_from.get(iid, []):
@@ -827,7 +1080,7 @@ class App(tk.Tk):
             if sid in book:
                 status, tag = f"Znasz (poziom {book[sid]})", "masz"
             elif where:
-                status, tag = f"Do zdobycia: {len(where)} {('miejsce' if len(where) == 1 else 'miejsc')}" + \
+                status, tag = f"Do zdobycia: {len(where)} {miejsc(len(where))}" + \
                               (f", w tym {shops} na sprzedaż" if shops else ""), "jest"
             elif sid in scrolls:
                 status, tag = "Masz tylko zwoje", "masz"
@@ -1037,13 +1290,15 @@ def export_world(app, path):
             typ, lvl = app.entry_type(e)
             places.append([app.map_label(p), app.map_state(p), app.place_label(p), p.type, e.kind,
                            app.ename(e.kind, e.id), e.id, e.count, typ, lvl, ROLA.get(e.role, e.role), e.note])
-    items = [["Nazwa", "ID", "Typ", "Poziom", "Rasa", "Cena", "Limit w grze", "Wylosowano", "Miejsc", "Status"]]
+    items = [["Nazwa", "ID", "Typ", "Premie", "Poziom", "Rasa", "Cena", "Limit w grze", "Wylosowano", "Miejsc",
+              "Status"]]
     for iid in sorted(app._item_ids(), key=lambda i: g.item_name(i).casefold()):
         it = g.items.get(iid) or {}
         if it.get("slot") in HIDDEN_SLOTS:
             continue
         where = len([x for x in w.by_id.get((ITEM, iid), []) if x[0].source != "bohater"])
-        items.append([g.item_name(iid), iid, app.item_type(iid), it.get("level", ""),
+        items.append([g.item_name(iid), iid, app.item_type(iid),
+                      ", ".join(bonus_text(bn) for bn in it.get("bonuses", [])), it.get("level", ""),
                       RASY.get(it.get("race"), it.get("race", "")), it.get("price"), it.get("maxcount"),
                       w.box.get(iid, 0), where, w.item_status(iid)[1]])
     path = Path(path)
@@ -1058,7 +1313,7 @@ def export_world(app, path):
     from openpyxl.utils import get_column_letter
     wb = Workbook()
     for ws, rows, widths in ((wb.active, places, [26, 30, 40, 18, 16, 30, 24, 8, 16, 8, 18, 28]),
-                             (wb.create_sheet(), items, [30, 24, 16, 8, 12, 9, 12, 12, 9, 60])):
+                             (wb.create_sheet(), items, [30, 24, 16, 50, 8, 12, 9, 12, 12, 9, 60])):
         ws.title = "Miejsca" if rows is places else "Przedmioty"
         for r in rows:
             ws.append(r)

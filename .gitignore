@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# zapisy gry i wygenerowane listy zostaja lokalnie
+*.sav
+*.xlsx
+*.csv

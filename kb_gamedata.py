@@ -1,10 +1,17 @@
-"""Dane z instalacji gry King's Bounty: Armored Princess - nazwy i parametry.
+"""Dane z instalacji gry King's Bounty: Armored Princess / Crossworlds / Warriors of the North
+- nazwy i parametry.
 
 Gra trzyma definicje w archiwach ZIP z rozszerzeniem .kfs:
     sessions/<sesja>/ses.kfs      - items.txt, spells.txt i pliki dołączane (==plik.txt)
     sessions/<sesja>/loc_ses.kfs  - teksty w wybranym języku (<jęz>_items.lng, ...)
     data/app.ini                  - język i domyślna sesja
 Bez folderu gry aplikacja działa dalej, tylko pokazuje wewnętrzne identyfikatory.
+
+Warriors of the North dokłada drugą, dodatkową sesję (zapis ma w polu 'session'
+np. "addon/ice_and_fire" - patrz GameData._load) i pakuje ją nieco inaczej:
+    sessions/<sesja>/localization/<jęz>_loc_ses_*.kfs  - teksty, zamiast loc_ses.kfs
+    sessions/<sesja>/locations/<mapa>.land.loc          - rozmiar mapy jako luźny
+                                                           plik, zamiast wpisu w ses.kfs
 """
 
 import io
@@ -14,7 +21,9 @@ import zipfile
 from pathlib import Path
 
 GAME_DIR_NAMES = ("Kings Bounty Armored Princess", "King's Bounty Armored Princess",
-                  "Kings Bounty Crossworlds", "King's Bounty Crossworlds")
+                  "Kings Bounty Crossworlds", "King's Bounty Crossworlds",
+                  "Kings Bounty Warriors of the North", "King's Bounty Warriors of the North",
+                  "Kings Bounty - Warriors of the North", "King's Bounty - Warriors of the North")
 
 SLOTY = {
     "weapon": "Broń", "armor": "Pancerz", "helmet": "Hełm", "boots": "Buty",
@@ -25,7 +34,8 @@ SLOTY = {
 CECHY = {"rare": "rzadki", "quest": "zadaniowy", "usable": "do użycia", "moral": "ma morale",
          "container": "pojemnik", "multiuse": "wielorazowy", "dialog": "z dialogiem"}
 RASY = {"human": "ludzie", "elf": "elfy", "orc": "orki", "dwarf": "krasnoludy",
-        "undead": "nieumarli", "demon": "demony", "neutral": "neutralny", "lizard": "jaszczury"}
+        "undead": "nieumarli", "demon": "demony", "neutral": "neutralny", "lizard": "jaszczury",
+        "viking": "wikingowie", "ice_elf": "elfy lodu", "lizardead": "nieumarłe jaszczury"}
 SZKOLY = {"1": "Porządek", "2": "Zniekształcenie", "3": "Chaos", "4": "Przygoda"}
 
 
@@ -149,7 +159,7 @@ class GameData:
         self._atlas_idx = None
         self._units = {}
         self._map_sizes = {}
-        self.session_dir = None
+        self.session_dirs = []
         if self.game_dir:
             try:
                 self._load(session.strip("/") or "addon")
@@ -163,16 +173,30 @@ class GameData:
     # --- wczytanie ---
 
     def _load(self, session):
+        """session to jedna nazwa ("addon") albo kilka sklejonych ukośnikiem, tak jak
+        zapis trzyma to w polu 'session' ("addon/ice_and_fire" - Warriors of the North:
+        sesja bazowa + dodatkowa). Każda wczytywana jest osobno i dokłada swoje
+        przedmioty/czary/teksty - setdefault() w _load_session nie nadpisuje tego,
+        co już wczytała wcześniejsza sesja."""
         app_ini = self.game_dir / "data" / "app.ini"
-        if app_ini.is_file():
-            ini = app_ini.read_text("cp1251", "replace")
-            m = re.search(r'~language\s+"(\w+)"', ini)
-            self.language = m.group(1) if m else "eng"
-            if not (self.game_dir / "sessions" / session).is_dir():
-                m = re.search(r'~session\s+"(\w+)"', ini)
-                session = m.group(1) if m else session
-        sdir = self.game_dir / "sessions" / session
-        self.session_dir = sdir
+        ini = app_ini.read_text("cp1251", "replace") if app_ini.is_file() else ""
+        m = re.search(r'~language\s+"(\w+)"', ini)
+        self.language = m.group(1) if m else "eng"
+
+        names = [s for s in session.split("/") if s]
+        if not names or not (self.game_dir / "sessions" / names[0]).is_dir():
+            m = re.search(r'~session\s+"(\w+)"', ini)
+            names = [m.group(1)] if m else (names or ["addon"])
+
+        for name in names:
+            sdir = self.game_dir / "sessions" / name
+            if sdir.is_dir():
+                self.session_dirs.append(sdir)
+                self._load_session(sdir)
+        if not self.session_dirs:
+            raise FileNotFoundError(f"Brak folderu sesji „{session}” w {self.game_dir / 'sessions'}")
+
+    def _load_session(self, sdir):
         with zipfile.ZipFile(sdir / "ses.kfs") as z:
             names = set(z.namelist())
 
@@ -180,7 +204,10 @@ class GameData:
                 return _decode(z.read(fname)) if fname in names else ""
 
             files = []
-            for top in ("items.txt", "spells.txt"):
+            # items_dlc.txt (np. zestaw przedmiotów bonusowych z przedsprzedaży) nie
+            # jest dociągany przez żaden "==" - trzeba go wczytać wprost, inaczej
+            # jego przedmioty zostają bez nazwy/ikony/premii.
+            for top in ("items.txt", "spells.txt", "items_dlc.txt"):
                 files += [f for f in self._with_includes(read, top) if f not in files]
             for fname in files:
                 for b in parse_blocks(read(fname)):
@@ -196,7 +223,10 @@ class GameData:
                             "image": b.get("image"), "scroll_image": b.get("button_image"),
                             "levels": dict(lv.fields) if lv else {},
                             "params": dict(par.fields) if par else {}})
-        with zipfile.ZipFile(sdir / "loc_ses.kfs") as z:
+        loc_kfs = self._loc_kfs_path(sdir)
+        if loc_kfs is None:
+            return
+        with zipfile.ZipFile(loc_kfs) as z:
             prefix = f"{self.language}_"
             for fname in z.namelist():
                 if fname.startswith(prefix) and fname.endswith(".lng") and "_chat_" not in fname:
@@ -204,6 +234,20 @@ class GameData:
                         k, sep, v = line.partition("=")
                         if sep and not k.startswith("//"):
                             self.texts.setdefault(k.strip(), v.strip())
+
+    def _loc_kfs_path(self, sdir):
+        """Plik z tekstami sesji: 'loc_ses.kfs' wprost w folderze sesji (Armored
+        Princess/Crossworlds), albo 'localization/<jęz>_loc_ses_*.kfs' - osobny
+        plik na język (tak pakuje to Warriors of the North). None, jeśli brak obu."""
+        direct = sdir / "loc_ses.kfs"
+        if direct.is_file():
+            return direct
+        loc_dir = sdir / "localization"
+        if loc_dir.is_dir():
+            matches = sorted(loc_dir.glob(f"{self.language}_loc_ses_*.kfs"))
+            if matches:
+                return matches[0]
+        return None
 
     @staticmethod
     def _with_includes(read, fname):
@@ -283,12 +327,23 @@ class GameData:
     # --- jednostki ---
 
     def unit_info(self, unit_id):
-        """Statystyki jednostki z pliku <id>.atom (sekcja arena_params) albo None."""
+        """Statystyki jednostki z pliku <id>.atom (sekcja arena_params) albo None.
+
+        Armored Princess/Crossworlds trzymają .atom w data/data.kfs; Warriors of
+        the North - w ses.kfs każdej wczytanej sesji zamiast tego."""
         if unit_id in self._units:
             return self._units[unit_id]
         info = None
+        want = f"{unit_id}.atom".lower()
         z = self._zip("data/data.kfs")
-        name = self._names(z).get(f"{unit_id}.atom".lower()) if z else None
+        name = self._names(z).get(want) if z else None
+        if not name:
+            for sdir in self.session_dirs:
+                zs = self._zip(sdir / "ses.kfs")
+                name = self._names(zs).get(want) if zs else None
+                if name:
+                    z = zs
+                    break
         if name:
             blocks = parse_blocks(_decode(z.read(name)))
             ap = next((b for b in blocks if b.name == "arena_params"), None)
@@ -331,13 +386,18 @@ class GameData:
     # --- obrazki (wymagają Pillow) ---
 
     def _zip(self, rel):
-        if rel not in self._zips:
-            p = self.game_dir / rel if self.game_dir else None
+        """rel to albo ścieżka względem game_dir (jak dotąd), albo gotowa ścieżka
+        bezwzględna (np. do ses.kfs którejś z sesji) - rozróżniane po Path.is_absolute()."""
+        key = str(rel)
+        if key not in self._zips:
+            p = Path(rel)
+            if not p.is_absolute():
+                p = self.game_dir / rel if self.game_dir else None
             try:
-                self._zips[rel] = zipfile.ZipFile(p) if p and p.is_file() else None
+                self._zips[key] = zipfile.ZipFile(p) if p and p.is_file() else None
             except (OSError, zipfile.BadZipFile):
-                self._zips[rel] = None
-        return self._zips[rel]
+                self._zips[key] = None
+        return self._zips[key]
 
     def _names(self, z):
         key = id(z)
@@ -409,18 +469,39 @@ class GameData:
         return self.image(f"radar_{map_id}.png")
 
     def map_size(self, map_id):
-        """Rozmiar mapy w jednostkach świata (kafle z <mapa>.land.loc po 16 jednostek) albo None."""
+        """Rozmiar mapy w jednostkach świata (kafle z <mapa>.land.loc po 16 jednostek) albo None.
+
+        Mapa może być w dowolnej wczytanej sesji - Warriors of the North trzyma
+        swoje mapy w osobnej, dodatkowej sesji, nie w bazowej "addon"."""
         if map_id not in self._map_sizes:
             size = None
-            try:
-                from kb_save import Reader
-                with zipfile.ZipFile(self.session_dir / "ses.kfs") as z:
-                    land = Reader(z.read(f"{map_id}.land.loc")).root()
-                size = (land.get("lsizex") * TILE, land.get("lsizey") * TILE)
-            except (OSError, KeyError, TypeError, ValueError, AttributeError, zipfile.BadZipFile):
-                pass
+            for sdir in self.session_dirs:
+                size = self._land_size(sdir, map_id)
+                if size:
+                    break
             self._map_sizes[map_id] = size
         return self._map_sizes[map_id]
+
+    @staticmethod
+    def _land_size(sdir, map_id):
+        try:
+            from kb_save import Reader
+        except ImportError:
+            return None
+        fname = f"{map_id}.land.loc"
+        try:
+            with zipfile.ZipFile(sdir / "ses.kfs") as z:
+                land = Reader(z.read(fname)).root()
+            return (land.get("lsizex") * TILE, land.get("lsizey") * TILE)
+        except (OSError, KeyError, TypeError, ValueError, AttributeError, zipfile.BadZipFile):
+            pass
+        # Warriors of the North ships .land.loc as a loose file instead of a zip entry.
+        loose = sdir / "locations" / fname
+        try:
+            land = Reader(loose.read_bytes()).root()
+            return (land.get("lsizex") * TILE, land.get("lsizey") * TILE)
+        except (OSError, KeyError, TypeError, ValueError, AttributeError, zipfile.BadZipFile):
+            return None
 
     def map_uv(self, map_id, pos):
         """Pozycja (x, z) -> współrzędne na minimapie (0..1, 0..1) albo None.

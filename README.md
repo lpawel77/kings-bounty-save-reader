@@ -1,8 +1,12 @@
 # King's Bounty – czytnik zapisu
 
-Okienkowa przeglądarka zapisów **King's Bounty: Armored Princess** (`.sav`). Pokazuje, co gra wylosowała
-w każdym budynku, zamku, skrzyni i armii na wszystkich mapach (także tych, na których jeszcze nie byłeś),
-oraz czy dany przedmiot w ogóle pojawi się w tej rozgrywce.
+Okienkowa przeglądarka zapisów **King's Bounty: Armored Princess**, **Crossworlds** i **Warriors of the
+North**. Pokazuje, co gra wylosowała w każdym budynku, zamku, skrzyni i armii na wszystkich mapach (także
+tych, na których jeszcze nie byłeś), oraz czy dany przedmiot w ogóle pojawi się w tej rozgrywce.
+
+Warriors of the North pakuje zapisy i dane gry inaczej niż Armored Princess (zapis to folder, nie plik
+`.sav`; część danych jest w drugiej, dodatkowej sesji; niektóre pliki są luźne zamiast w archiwum) – czytnik
+obsługuje obie postacie przezroczyście, patrz „Skąd są dane” niżej.
 
 ## Uruchomienie
 
@@ -16,8 +20,11 @@ aplikacja działa, tylko bez obrazków), eksport do `.xlsx` – `openpyxl` (bez 
 działa na komputerze bez Pythona. Plików gry exe nie zawiera: nazwy, obrazki i mapy czyta z zainstalowanej gry
 (wykrywanej w Steam albo wskazanej przyciskiem **Folder gry…**). Przed przebudową zamknij uruchomiony exe.
 
-Przycisk **Otwórz zapis…** startuje w folderze zapisów gry (`Dokumenty\My Games\Kings Bounty Princess\$save`).
-Ostatni plik i folder gry są zapamiętywane w `%APPDATA%\kb_save_reader.json`.
+Przycisk **Otwórz zapis…** pokazuje listę wszystkich wykrytych zapisów (ze wszystkich zainstalowanych gier
+z serii, najnowszy na górze) – wybierz i **Otwórz**, albo **Przeglądaj…**, żeby wskazać plik ręcznie. Dla
+Warriors of the North zapis to folder (`$save\addon\ice_and_fire\<numer albo "auto">`); jeśli wskazujesz go
+ręcznie, wystarczy wybrać dowolny z jego plików (`data`, `info`, `name`, `crc`) – czytnik sam trafi do
+właściwego folderu. Ostatni zapis i folder gry są zapamiętywane w `%APPDATA%\kb_save_reader.json`.
 
 ## Zakładki
 
@@ -54,7 +61,16 @@ kliknięcie na przedmiot/czar/jednostkę w zawartości miejsca – do jego karty
 
 ## Skąd są dane
 
-- Zapis (`.sav`) to ZIP; część `savedata` to drzewo opisane w `kb_save.py`.
+- Zapis Armored Princess/Crossworlds (`.sav`) to ZIP; Warriors of the North trzyma to samo jako folder
+  (`data`/`info`/`crc`/`name` zamiast wpisów `savedata`/`saveinfo`/`savecrc` w archiwum, plus `name` z
+  tytułem zapisu, którego tamte dwie gry nie mają). Format drzewa w środku jest identyczny dla obu -
+  patrz `kb_save.py`.
+- Zapis sam mówi, z jakiej sesji (jakich plików gry) korzysta – pole `session` w `saveinfo`/`info`
+  (np. `"addon"` albo, dla Warriors of the North, `"addon/ice_and_fire"` - sesja bazowa + dodatkowa,
+  wczytywane i łączone obie). Stąd `GameData` wie, gdzie szukać nazw, nawet gdy dodatek ma własny,
+  rozdzielny zestaw plików (patrz `kb_gamedata.py` - `loc_ses.kfs` kontra `localization/*.kfs`,
+  `.land.loc` w `ses.kfs` kontra luźny plik, `.atom` jednostek w `data.kfs` kontra w `ses.kfs`).
+- Część `savedata`/`data` to drzewo opisane w `kb_save.py`.
 - Gra losuje zawartość wszystkich wysp na początku rozgrywki. Dla miejsc jeszcze niepostawionych na mapie
   (nieodwiedzone wyspy, nagrody za zadania) wynik leży w generatorach `server/embs/els` (pole `pregen`).
   Odwiedzone mapy są w `session/lus/lubodies` i pokazują **stan bieżący** – to, co zabrałeś, już tam nie widać.

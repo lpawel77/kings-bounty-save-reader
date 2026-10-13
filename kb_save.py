@@ -1,11 +1,17 @@
-"""Odczyt zapisów gry King's Bounty: Armored Princess (.sav).
+"""Odczyt zapisów gry King's Bounty: Armored Princess / Crossworlds / Warriors of the North.
 
-Plik .sav to archiwum ZIP z trzema częściami:
+Armored Princess i Crossworlds trzymają zapis jako plik .sav - archiwum ZIP
+z trzema częściami:
     saveinfo  - podsumowanie slotu (poziom, armia, zrzut ekranu, miniatura)
     savedata  - pełny stan gry, nagłówek 'slcb' + strumień zlib
     savecrc   - suma kontrolna (algorytm nieznany, skrypt tylko czyta)
 
-Obie części danych używają tego samego formatu drzewa:
+Warriors of the North trzyma to samo w folderze zamiast ZIP-a - każda część to
+osobny plik o tej samej nazwie (info/data/crc), plus plik 'name' z tytułem
+zapisu (UTF-16LE), którego AP/Crossworlds nie mają (tytuł tam jest polem
+wewnątrz saveinfo). load_save() przyjmuje obie postacie.
+
+Obie części danych (saveinfo/info i savedata/data) używają tego samego formatu drzewa:
     węzeł  := u32 rodzaj, [klucz], ciało
     ciało  := u32 n, n * u32 typ, n * pole
     pole   := klucz (u32 dł. + bajty) + wartość zależna od typu
@@ -117,10 +123,44 @@ class Reader:
         return node
 
 
+SLOT_FILES = ("data", "info", "crc", "name")
+
+
+def resolve_save_path(path) -> Path:
+    """Warriors of the North trzyma zapis jako folder (data/info/crc/name) zamiast
+    jednego pliku .sav. Jeśli ktoś wskaże plik wewnątrz takiego folderu, zwróć folder."""
+    path = Path(path)
+    if path.is_file() and path.name in SLOT_FILES:
+        return path.parent
+    return path
+
+
+def save_title(path) -> str:
+    """Nazwa zapisu do pokazania w GUI: rdzeń nazwy pliku .sav, albo - dla folderu
+    slotu Warriors of the North - zdekodowany tytuł z pliku 'name' (UTF-16LE)."""
+    path = resolve_save_path(path)
+    if path.is_dir():
+        name_file = path / "name"
+        if name_file.is_file():
+            try:
+                title = name_file.read_bytes().decode("utf-16le", "replace").strip("\x00").strip()
+            except OSError:
+                title = ""
+            if title:
+                return title
+        return path.name
+    return path.stem
+
+
 def load_save(path):
-    with zipfile.ZipFile(path) as z:
-        info_raw = z.read("saveinfo")
-        data_raw = z.read("savedata")
+    path = resolve_save_path(path)
+    if path.is_dir():
+        info_raw = (path / "info").read_bytes()
+        data_raw = (path / "data").read_bytes()
+    else:
+        with zipfile.ZipFile(path) as z:
+            info_raw = z.read("saveinfo")
+            data_raw = z.read("savedata")
     if data_raw[:4] != b"slcb":
         raise ValueError("Nieoczekiwany nagłówek savedata (brak 'slcb')")
     size, csize = struct.unpack_from("<II", data_raw, 4)

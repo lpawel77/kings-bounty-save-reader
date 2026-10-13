@@ -7,6 +7,7 @@ mapach (także nieodwiedzonych), oraz czy dany przedmiot w ogóle pojawi się w 
 """
 
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -24,7 +25,7 @@ try:
 except ImportError:  # bez Pillow aplikacja działa, tylko bez obrazków
     Image = ImageTk = None
 from kb_mapview import MapView
-from kb_save import load_save, print_report
+from kb_save import load_save, print_report, resolve_save_path, save_title
 from kb_world import ARMY, ITEM, RES, ROLA, SPELL, UNIT, World, pretty_atom
 from kb_world import _miejsc as miejsc
 
@@ -49,10 +50,84 @@ def save_dirs():
     if os.environ.get("OneDrive"):
         docs.append(Path(os.environ["OneDrive"]) / "Documents")
     for d in docs:
-        for name in ("Kings Bounty Princess", "King's Bounty Armored Princess", "Kings Bounty Crossworlds"):
+        for name in ("Kings Bounty Princess", "King's Bounty Armored Princess", "Kings Bounty Crossworlds",
+                     "Kings Bounty Warriors of the North"):
             p = d / "My Games" / name / "$save"
             if p.is_dir():
                 yield p
+
+
+def _wotn_slots(save_dir):
+    """Zapisy w stylu Warriors of the North: $save/addon/<dodatek>/<id albo 'auto'>/
+    (folder z plikami data+info+crc+name), zamiast płaskich plików .sav."""
+    addon_dir = save_dir / "addon"
+    if not addon_dir.is_dir():
+        return
+    try:
+        addon_subdirs = list(addon_dir.iterdir())
+    except OSError:
+        return
+    for addon_sub in addon_subdirs:
+        if not addon_sub.is_dir():
+            continue
+        try:
+            slots = addon_sub.iterdir()
+        except OSError:
+            continue
+        for slot in slots:
+            if (slot / "data").is_file() and (slot / "info").is_file():
+                yield slot
+
+
+def list_all_saves():
+    """Wszystkie wykryte zapisy - pliki .sav (Armored Princess/Crossworlds) i foldery
+    slotów (Warriors of the North) - od najnowszego."""
+    found = []
+    for base in save_dirs():
+        found += base.glob("*.sav")
+        found += _wotn_slots(base)
+    found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return found
+
+
+def choose_save_dialog(parent, saves):
+    """Lista wykrytych zapisów do wyboru; zwraca {'path': ...} albo {'browse': True}
+    (użytkownik chce wskazać plik ręcznie) albo {} (anulowano)."""
+    win = tk.Toplevel(parent)
+    win.title("Wybierz zapis")
+    win.transient(parent)
+    win.geometry("560x420")
+    tk.Label(win, text="Wykryte zapisy (najnowszy na górze):", anchor="w").pack(fill="x", padx=10, pady=(10, 4))
+    frame, lb = scrolled(win, tk.Listbox, font=("Consolas", 10))
+    frame.pack(fill="both", expand=True, padx=10, pady=4)
+    for p in saves:
+        when = datetime.datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        lb.insert("end", f"{save_title(p):<40} {when}")
+    if saves:
+        lb.selection_set(0)
+    result = {}
+
+    def pick(_event=None):
+        sel = lb.curselection()
+        if sel:
+            result["path"] = saves[sel[0]]
+        win.destroy()
+
+    def browse():
+        result["browse"] = True
+        win.destroy()
+
+    btn_row = ttk.Frame(win)
+    btn_row.pack(fill="x", padx=10, pady=(0, 10))
+    ttk.Button(btn_row, text="Przeglądaj…", command=browse).pack(side="left")
+    ttk.Button(btn_row, text="Anuluj", command=win.destroy).pack(side="right")
+    ttk.Button(btn_row, text="Otwórz", command=pick).pack(side="right", padx=(0, 6))
+    lb.bind("<Double-Button-1>", pick)
+    win.bind("<Return>", pick)
+    win.bind("<Escape>", lambda e: win.destroy())
+    win.grab_set()
+    win.wait_window()
+    return result
 
 
 def sort_key(value):
@@ -445,11 +520,20 @@ class App(tk.Tk):
         self._update_game_label()
 
     def ask_open(self):
+        saves = list_all_saves()
+        if saves:
+            result = choose_save_dialog(self, saves)
+            if result.get("path"):
+                self.open_save(result["path"])
+                return
+            if not result.get("browse"):
+                return  # anulowano
         initial = self.cfg.get("last_save")
         initdir = str(Path(initial).parent) if initial else next((str(d) for d in save_dirs()), None)
         path = filedialog.askopenfilename(
             title="Wybierz zapis King's Bounty", initialdir=initdir,
-            filetypes=[("Zapisy King's Bounty", "*.sav"), ("Wszystkie pliki", "*.*")])
+            filetypes=[("Zapisy King's Bounty", "*.sav"), ("Pliki zapisu (Warriors of the North)", "data"),
+                       ("Wszystkie pliki", "*.*")])
         if path:
             self.open_save(path)
 
@@ -483,17 +567,53 @@ class App(tk.Tk):
             return str(found[0])
         return None
 
+    def _game_dir_for(self, session, is_folder_save):
+        """Folder gry pasujący do zapisu. Samo porównanie nazw sesji nie wystarcza:
+        Armored Princess/Crossworlds i Warriors of the North oba mają sesję o
+        nazwie "addon" (tyle że z inną zawartością), więc zapis z polem
+        session="addon" pasuje po nazwie do obu instalacji naraz. Rozstrzyga
+        kształt zapisu: Warriors of the North zawsze zapisuje jako folder
+        (data/info/crc/name), AP/Crossworlds zawsze jako plik .sav - i tylko
+        instalacja Warriors of the North ma w swoim app.ini "~sessionadd"."""
+        wanted = [s for s in session.split("/") if s]
+
+        def fits(d):
+            return bool(d) and is_game_dir(d) and all((Path(d) / "sessions" / s).is_dir() for s in wanted)
+
+        def shape_matches(d):
+            ini = Path(d) / "data" / "app.ini"
+            try:
+                has_sessionadd = "~sessionadd" in ini.read_text("cp1251", "replace")
+            except OSError:
+                has_sessionadd = False
+            return has_sessionadd == is_folder_save
+
+        configured = self.cfg.get("game_dir")
+        candidates, seen = [], set()
+        for d in [configured, *(str(p) for p in find_game_dirs())]:
+            if d and d not in seen:
+                seen.add(d)
+                candidates.append(d)
+
+        best = next((d for d in candidates if fits(d) and shape_matches(d)), None) \
+            or next((d for d in candidates if fits(d)), None)
+        if best and best != configured:
+            self.cfg["game_dir"] = best
+            self._save_cfg()
+        return best or self._game_dir()
+
     def _update_game_label(self):
         d = self._game_dir()
         self.game_lbl.config(text=f"Folder gry: {d}" if d else "Nie znaleziono folderu gry – nazwy będą identyfikatorami")
 
     def open_save(self, path):
+        path = resolve_save_path(path)
         self.config(cursor="watch")
         self.update_idletasks()
         try:
             info, data = load_save(path)
             session = info.get("session") or "addon"
-            key = (self._game_dir(), session)
+            key = (self._game_dir_for(session, path.is_dir()), session)
             if key not in self._game_cache:
                 self._game_cache[key] = GameData(key[0], session)
             if self.game is not self._game_cache[key]:
@@ -516,7 +636,7 @@ class App(tk.Tk):
         names = [g.map_name(m) for m, _ in w.maps()]
         self._dup_maps = {n for n in names if names.count(n) > 1}
         h, z = w.hero["bohater"], w.hero["zapis"]
-        self.title(f"{APP_TITLE} – {Path(self.save_path).name}")
+        self.title(f"{APP_TITLE} – {save_title(self.save_path)}")
         self.title_lbl.config(text=f"{h['imie']} – {h['klasa'].split('(')[-1].rstrip(')')}, poziom {h['poziom']}")
         mtime = Path(self.save_path).stat().st_mtime
         import datetime
